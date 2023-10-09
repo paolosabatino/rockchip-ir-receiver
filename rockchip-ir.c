@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2012, Code Aurora Forum. All rights reserved.
- */
+*/
 
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -22,8 +22,8 @@
 #define ROCKCHIP_IR_DEVICE_NAME	"rockchip_ir_recv"
 
 /*
- * SIP/TEE constants for remote calls
- */
+* SIP/TEE constants for remote calls
+*/
 #define SIP_REMOTECTL_CFG				0x8200000b
 #define SIP_SUSPEND_MODE		0x82000003
 #define SIP_REMOTECTL_CFG		0x8200000b
@@ -43,18 +43,18 @@
 #define REMOTECTL_PWRKEY_WAKEUP			0xdeadbeaf /* wakeup state */
 
 /*
- * PWM Registers
- * Each PWM has its own control registers
- */
+* PWM Registers
+* Each PWM has its own control registers
+*/
 #define PWM_REG_CNTR	0x00  /* Counter Register */
 #define PWM_REG_HPR		0x04  /* Period Register */
 #define PWM_REG_LPR		0x08  /* Duty Cycle Register */
 #define PWM_REG_CTRL	0x0c  /* Control Register */
 
 /*
- * PWM General registers
- * Registers shared among PWMs
- */
+* PWM General registers
+* Registers shared among PWMs
+*/
 #define PWM_REG_INT_EN  0x44
 
 /*REG_CTRL bits definitions*/
@@ -98,9 +98,9 @@ struct rockchip_rc_dev {
 };
 
 static struct arm_smccc_res __invoke_sip_fn_smc(unsigned long function_id,
-                                                unsigned long arg0,
-                                                unsigned long arg1,
-                                                unsigned long arg2)
+												unsigned long arg0,
+												unsigned long arg1,
+												unsigned long arg2)
 {
 	struct arm_smccc_res res;
 
@@ -133,15 +133,15 @@ static irqreturn_t rockchip_ir_recv_irq(int irq, void *dev_id)
 	struct device *pmdev = gpio_dev->pmdev;
 
 	/*
-	 * For some cpuidle systems, not all:
-	 * Respond to interrupt taking more latency when cpu in idle.
-	 * Invoke asynchronous pm runtime get from interrupt context,
-	 * this may introduce a millisecond delay to call resume callback,
-	 * where to disable cpuilde.
-	 *
-	 * Two issues lead to fail to decode first frame, one is latency to
-	 * respond to interrupt, another is delay introduced by async api.
-	 */
+	* For some cpuidle systems, not all:
+	* Respond to interrupt taking more latency when cpu in idle.
+	* Invoke asynchronous pm runtime get from interrupt context,
+	* this may introduce a millisecond delay to call resume callback,
+	* where to disable cpuilde.
+	*
+	* Two issues lead to fail to decode first frame, one is latency to
+	* respond to interrupt, another is delay introduced by async api.
+	*/
 	if (pmdev)
 		pm_runtime_get(pmdev);
 
@@ -251,7 +251,7 @@ static int rockchip_pwm_sip_wakeup_init(struct rockchip_rc_dev *gpio_dev)
 		return -1;
 	}
 
-    dev_info(dev, "Rockchip SIP initialized, for power off version 0x%lx\n", res.a1);
+	dev_info(dev, "Rockchip SIP initialized, for power off version 0x%lx\n", res.a1);
 
 	irq_data = irq_get_irq_data(gpio_dev->pwm_wake_irq);
 	if (!irq_data) {
@@ -269,10 +269,6 @@ static int rockchip_pwm_sip_wakeup_init(struct rockchip_rc_dev *gpio_dev)
 	}
 	
 	sip_smc_remotectl_config(REMOTECTL_SET_PWM_CH, gpio_dev->pwm_id);
-	sip_smc_remotectl_config(REMOTECTL_SET_PWRKEY, 0x4040f4 << 8);
-	sip_smc_remotectl_config(REMOTECTL_SET_PWRKEY, 0x4040b2 << 8);
-	sip_smc_remotectl_config(REMOTECTL_SET_PWRKEY, 0x40400b << 8);
-	sip_smc_remotectl_config(REMOTECTL_SET_PWRKEY, 0x40404d << 8);
 	
 	sip_smc_remotectl_config(REMOTECTL_ENABLE, 1);
 	
@@ -490,6 +486,41 @@ static int rockchip_ir_recv_remove(struct platform_device *pdev)
 	return 0;
 }
 
+static int rockchip_ir_register_power_key(struct device *dev)
+{
+	
+	struct rockchip_rc_dev *gpio_dev = dev_get_drvdata(dev);
+	
+	struct rc_map *key_map;
+	struct rc_map_table *key;
+	int idx, scancode;
+	
+	key_map = &gpio_dev->rcdev->rc_map;
+	
+	dev_info(dev, "remote key table %s, key map of %d items\n", key_map->name, key_map->len);
+	
+	for (idx = 0; idx < key_map->len; idx++) {
+		
+		key = &key_map->scan[idx];
+		
+		if (key->keycode != KEY_POWER)
+			continue;
+		
+		scancode = key->scancode & 0xffff00;
+		scancode |= (~key->scancode) & 0xff;
+		scancode <<= 8;
+		
+		sip_smc_remotectl_config(REMOTECTL_SET_PWRKEY, scancode);
+		
+		dev_info(dev, "registered scancode %08llx (SIP: %8x)\n", key->scancode, scancode);
+		
+	}
+	
+	return 0;
+	
+}
+
+
 #ifdef CONFIG_PM
 static int rockchip_ir_recv_suspend(struct device *dev)
 {
@@ -504,6 +535,8 @@ static int rockchip_ir_recv_suspend(struct device *dev)
 	*/
 	
 	dev_info(dev, "initialize rockchip PWM for SIP wakeup\n");
+	
+	rockchip_ir_register_power_key(dev);
 	
 	disable_irq(gpio_dev->irq);
 	dev_info(dev, "GPIO IRQ disabled\n");
