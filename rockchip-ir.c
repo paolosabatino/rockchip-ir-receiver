@@ -16,10 +16,18 @@
 #include <linux/irq.h>
 #include <linux/arm-smccc.h>
 #include <linux/clk.h>
+#include <linux/reboot.h>
+#include <uapi/linux/psci.h>
 #include <media/rc-core.h>
 #include <soc/rockchip/rockchip_sip.h>
 
 #define ROCKCHIP_IR_DEVICE_NAME	"rockchip_ir_recv"
+
+#ifdef CONFIG_64BIT
+#define PSCI_FN_NATIVE(version, name)	PSCI_##version##_FN64_##name
+#else
+#define PSCI_FN_NATIVE(version, name)	PSCI_##version##_FN_##name
+#endif
 
 /*
 * SIP/TEE constants for remote calls
@@ -92,6 +100,8 @@ struct rockchip_rc_dev {
 	void __iomem *pwm_base;
 	int pwm_wake_irq;
 	int pwm_id;
+	bool use_shutdown_handler; // if true, installs a shutdown handler and triggers virtual poweroff
+	bool use_suspend_handler; // if true, virtual poweroff is used as suspend mode otherwise use as regular suspend
 	struct pinctrl *pinctrl;
 	struct pinctrl_state *pinctrl_state_default;
 	struct pinctrl_state *pinctrl_state_suspend;
@@ -123,6 +133,14 @@ int sip_smc_set_suspend_mode(u32 ctrl, u32 config1, u32 config2)
 	struct arm_smccc_res res;
 
 	res = __invoke_sip_fn_smc(SIP_SUSPEND_MODE, ctrl, config1, config2);
+	return res.a0;
+}
+
+int sip_smc_virtual_poweroff(void)
+{
+	struct arm_smccc_res res;
+
+	res = __invoke_sip_fn_smc(PSCI_FN_NATIVE(1_0, SYSTEM_SUSPEND), 0, 0, 0);
 	return res.a0;
 }
 
@@ -239,38 +257,29 @@ static int rockchip_pwm_sip_wakeup_init(struct rockchip_rc_dev *gpio_dev)
 	
 	struct device *dev = &gpio_dev->rcdev->dev;
 	
-	struct arm_smccc_res res;
 	struct irq_data *irq_data;
 	long hwirq;
 	int ret;
-	
-	arm_smccc_smc(ROCKCHIP_SIP_SIP_VERSION, ROCKCHIP_SIP_IMPLEMENT_V2, SECURE_REG_WR, 0, 0, 0, 0, 0, &res);
-
-	if (res.a0) {
-		dev_err(dev, "Unable to initialize Rockchip SIP v2\n");
-		return -1;
-	}
-
-	dev_info(dev, "Rockchip SIP initialized, for power off version 0x%lx\n", res.a1);
 
 	irq_data = irq_get_irq_data(gpio_dev->pwm_wake_irq);
 	if (!irq_data) {
 		dev_err(dev, "could not get irq data\n");
-		// return -1;
+		return -1;
 	}
 	
 	hwirq = irq_data->hwirq;
 	dev_info(dev, "use hwirq %ld, pwm chip id %d for PWM SIP wakeup\n", hwirq, gpio_dev->pwm_id);
 	
-	ret = sip_smc_remotectl_config(REMOTECTL_SET_IRQ, (int)hwirq);
+	ret = 0;
+	
+	ret |= sip_smc_remotectl_config(REMOTECTL_SET_IRQ, (int)hwirq);
+	ret |= sip_smc_remotectl_config(REMOTECTL_SET_PWM_CH, gpio_dev->pwm_id);
+	ret |= sip_smc_remotectl_config(REMOTECTL_ENABLE, 1);
+	
 	if (ret) {
-		dev_err(dev, "set irq error, TEE does not support feature\n");
+		dev_err(dev, "SIP remote controller mode, TEE does not support feature\n");
 		return ret;
 	}
-	
-	sip_smc_remotectl_config(REMOTECTL_SET_PWM_CH, gpio_dev->pwm_id);
-	
-	sip_smc_remotectl_config(REMOTECTL_ENABLE, 1);
 	
 	sip_smc_set_suspend_mode(SUSPEND_MODE_CONFIG, 0x10042, 0);
 	sip_smc_set_suspend_mode(WKUP_SOURCE_CONFIG, 0x0, 0);
@@ -278,7 +287,6 @@ static int rockchip_pwm_sip_wakeup_init(struct rockchip_rc_dev *gpio_dev)
 	//sip_smc_set_suspend_mode(GPIO_POWER_CONFIG, i, gpio_temp[i]);
 	sip_smc_set_suspend_mode(SUSPEND_DEBUG_ENABLE, 0x1, 0);
 	sip_smc_set_suspend_mode(APIOS_SUSPEND_CONFIG, 0x0, 0);
-	
 	sip_smc_set_suspend_mode(VIRTUAL_POWEROFF, 0, 1);
 	
 	dev_info(dev, "TEE remote controller wakeup installed\n");
@@ -287,6 +295,194 @@ static int rockchip_pwm_sip_wakeup_init(struct rockchip_rc_dev *gpio_dev)
 	
 }
 
+static int rockchip_ir_recv_remove(struct platform_device *pdev)
+{
+	struct rockchip_rc_dev *gpio_dev = platform_get_drvdata(pdev);
+	struct device *pmdev = gpio_dev->pmdev;
+
+	if (pmdev) {
+		pm_runtime_get_sync(pmdev);
+		cpu_latency_qos_remove_request(&gpio_dev->qos);
+
+		pm_runtime_disable(pmdev);
+		pm_runtime_put_noidle(pmdev);
+		pm_runtime_set_suspended(pmdev);
+	}
+	
+	// Disable the remote controller handling of the Trust OS
+	sip_smc_remotectl_config(REMOTECTL_ENABLE, 0);
+	
+	// Disable the virtual poweroff of the Trust OS
+	sip_smc_set_suspend_mode(VIRTUAL_POWEROFF, 0, 0);	
+
+	return 0;
+}
+
+static int rockchip_ir_register_power_key(struct device *dev)
+{
+	
+	struct rockchip_rc_dev *gpio_dev = dev_get_drvdata(dev);
+	
+	struct rc_map *key_map;
+	struct rc_map_table *key;
+	int idx, scancode;
+	
+	key_map = &gpio_dev->rcdev->rc_map;
+	
+	dev_info(dev, "remote key table %s, key map of %d items\n", key_map->name, key_map->len);
+	
+	for (idx = 0; idx < key_map->len; idx++) {
+		
+		key = &key_map->scan[idx];
+		
+		if (key->keycode != KEY_POWER)
+			continue;
+		
+		scancode = key->scancode & 0xffff00;
+		scancode |= (~key->scancode) & 0xff;
+		scancode <<= 8;
+		
+		sip_smc_remotectl_config(REMOTECTL_SET_PWRKEY, scancode);
+		
+		dev_info(dev, "registered scancode %08llx (SIP: %8x)\n", key->scancode, scancode);
+		
+	}
+	
+	return 0;
+	
+}
+
+static int rockchip_ir_recv_suspend_prepare(struct device *dev)
+{
+	struct rockchip_rc_dev *gpio_dev = dev_get_drvdata(dev);
+	int ret;
+	
+	dev_info(dev, "initialize rockchip SIP virtual poweroff\n");
+	ret = rockchip_pwm_sip_wakeup_init(gpio_dev);
+	
+	if (ret)
+		return ret;
+	
+	rockchip_ir_register_power_key(dev);
+	
+	disable_irq(gpio_dev->irq);
+	dev_info(dev, "GPIO IRQ disabled\n");
+
+	ret = pinctrl_select_state(gpio_dev->pinctrl, gpio_dev->pinctrl_state_suspend);
+	if (ret) {
+		dev_err(dev, "unable to set pin in PWM mode\n");
+		return ret;
+	}
+	
+	dev_info(dev, "set pin configuration to PWM mode\n");
+	
+	rockchip_pwm_hw_init(gpio_dev);
+	dev_info(dev, "started pin PWM mode\n");
+	
+	return 0;
+	
+}
+
+#ifdef CONFIG_PM
+static int rockchip_ir_recv_suspend(struct device *dev)
+{
+	struct rockchip_rc_dev *gpio_dev = dev_get_drvdata(dev);
+	
+	/*
+	 * if property suspend-is-virtual-poweroff is set, we can disable
+	 * the regular gpio wakeup and enable the PWM mode for the Trust OS
+	 * to take control and react to remote control.
+	 * If the property is not set, we instead enable the wake up for the
+	 * regular gpio.
+	 */
+	if (gpio_dev->use_suspend_handler) {
+		
+		rockchip_ir_recv_suspend_prepare(dev);
+		
+	} else {
+		
+		if (device_may_wakeup(dev))
+			enable_irq_wake(gpio_dev->irq);
+		else
+			disable_irq(gpio_dev->irq);
+		
+	}
+
+	return 0;
+}
+
+static int rockchip_ir_recv_resume(struct device *dev)
+{
+	struct rockchip_rc_dev *gpio_dev = dev_get_drvdata(dev);
+	int ret;
+	
+	/*
+	 * In case suspend-is-virtual-poweroff property is set,
+	 * restore the pin from PWM mode to regular GPIO configuration
+	 * and stop the PWM function.
+	 * Otherwise, just enable the regular GPIO irq
+	 */
+	if (gpio_dev->use_suspend_handler) {
+	
+		rockchip_pwm_hw_stop(gpio_dev);
+		dev_info(dev, "stopped pin PWM mode\n");
+		
+		ret = pinctrl_select_state(gpio_dev->pinctrl, gpio_dev->pinctrl_state_default);
+		if (ret) {
+			dev_err(dev, "unable to restore pin in GPIO mode\n");
+			return ret;
+		}
+		dev_info(dev, "restored pin configuration di GPIO\n");
+		
+		enable_irq(gpio_dev->irq);
+		dev_info(dev, "restored GPIO IRQ\n");
+		
+	} else {
+		
+		if (device_may_wakeup(dev))
+			disable_irq_wake(gpio_dev->irq);
+		else
+			enable_irq(gpio_dev->irq);
+	
+	}
+
+	return 0;
+}
+
+static void rockchip_ir_recv_shutdown(struct platform_device *pdev)
+{
+	
+	struct device *dev = &pdev->dev;
+	struct rockchip_rc_dev *gpio_dev = dev_get_drvdata(dev);
+	
+	if (gpio_dev->use_shutdown_handler)
+		rockchip_ir_recv_suspend_prepare(dev);
+	
+	return;
+	
+}
+
+static int rockchip_ir_recv_sys_off(struct sys_off_data *data)
+{
+	
+	sip_smc_virtual_poweroff();
+	
+	return 0;
+	
+}
+
+static int rockchip_ir_recv_init_sip(void)
+{
+	struct arm_smccc_res res;
+	
+	arm_smccc_smc(ROCKCHIP_SIP_SIP_VERSION, ROCKCHIP_SIP_IMPLEMENT_V2, SECURE_REG_WR, 0, 0, 0, 0, 0, &res);
+	
+	if (res.a0)
+		return 0;
+		
+	return res.a1;
+	
+}
 
 static int rockchip_ir_recv_probe(struct platform_device *pdev)
 {
@@ -425,7 +621,19 @@ static int rockchip_ir_recv_probe(struct platform_device *pdev)
 		dev_err(dev, "could not enable IRQ wakeup\n");
 	}
 	
-	gpio_dev->pwm_id = 0x03;
+	ret = of_property_read_u32(np, "pwm-id", &gpio_dev->pwm_id);
+	if (ret) {
+		dev_err(dev, "missing pwm-id property\n");
+		goto error_pclk;
+	}
+	
+	if (gpio_dev->pwm_id > 3) {
+		dev_err(dev, "invalid pwm-id property\n");
+		goto error_pclk;
+	}
+	
+	gpio_dev->use_shutdown_handler = of_property_read_bool(np, "shutdown-is-virtual-poweroff");
+	gpio_dev->use_suspend_handler = of_property_read_bool(np, "suspend-is-virtual-poweroff");
 	
 	gpio_dev->pinctrl = devm_pinctrl_get(dev);
 	if (IS_ERR(gpio_dev->pinctrl)) {
@@ -445,9 +653,6 @@ static int rockchip_ir_recv_probe(struct platform_device *pdev)
 		goto error_pclk;
 	}
 	
-	dev_info(dev, "initialize rockchip SIP virtual poweroff\n");
-	rockchip_pwm_sip_wakeup_init(gpio_dev);
-
 	platform_set_drvdata(pdev, gpio_dev);
 
 	ret = devm_request_irq(dev, gpio_dev->irq, rockchip_ir_recv_irq,
@@ -458,7 +663,26 @@ static int rockchip_ir_recv_probe(struct platform_device *pdev)
 		goto error_pclk;
 	}
 	
-	return ret;
+	if (gpio_dev->use_shutdown_handler) {
+		
+		ret = devm_register_sys_off_handler(dev, SYS_OFF_MODE_POWER_OFF, 
+			SYS_OFF_PRIO_FIRMWARE, rockchip_ir_recv_sys_off, NULL);
+		
+		if (ret)
+			dev_err(dev, "could not register sys_off handler\n");
+		
+	}
+	
+	ret = rockchip_ir_recv_init_sip();
+	if (!ret) {
+		dev_err(dev, "Unable to initialize Rockchip SIP v2, virtual poweroff unavailable\n");
+		gpio_dev->use_shutdown_handler = false;
+		gpio_dev->use_suspend_handler = false;
+	} else {
+		dev_info(dev, "rockchip SIP initialized, version 0x%x\n", ret);
+	}
+		
+	return 0;
 
 error_pclk:
 	clk_unprepare(p_clk);	
@@ -466,130 +690,6 @@ error_clk:
 	clk_unprepare(clk);
 	
 	return -ENODEV;
-	
-}
-
-static int rockchip_ir_recv_remove(struct platform_device *pdev)
-{
-	struct rockchip_rc_dev *gpio_dev = platform_get_drvdata(pdev);
-	struct device *pmdev = gpio_dev->pmdev;
-
-	if (pmdev) {
-		pm_runtime_get_sync(pmdev);
-		cpu_latency_qos_remove_request(&gpio_dev->qos);
-
-		pm_runtime_disable(pmdev);
-		pm_runtime_put_noidle(pmdev);
-		pm_runtime_set_suspended(pmdev);
-	}
-
-	return 0;
-}
-
-static int rockchip_ir_register_power_key(struct device *dev)
-{
-	
-	struct rockchip_rc_dev *gpio_dev = dev_get_drvdata(dev);
-	
-	struct rc_map *key_map;
-	struct rc_map_table *key;
-	int idx, scancode;
-	
-	key_map = &gpio_dev->rcdev->rc_map;
-	
-	dev_info(dev, "remote key table %s, key map of %d items\n", key_map->name, key_map->len);
-	
-	for (idx = 0; idx < key_map->len; idx++) {
-		
-		key = &key_map->scan[idx];
-		
-		if (key->keycode != KEY_POWER)
-			continue;
-		
-		scancode = key->scancode & 0xffff00;
-		scancode |= (~key->scancode) & 0xff;
-		scancode <<= 8;
-		
-		sip_smc_remotectl_config(REMOTECTL_SET_PWRKEY, scancode);
-		
-		dev_info(dev, "registered scancode %08llx (SIP: %8x)\n", key->scancode, scancode);
-		
-	}
-	
-	return 0;
-	
-}
-
-
-#ifdef CONFIG_PM
-static int rockchip_ir_recv_suspend(struct device *dev)
-{
-	struct rockchip_rc_dev *gpio_dev = dev_get_drvdata(dev);
-	int ret;
-
-	/*
-	if (device_may_wakeup(dev))
-		enable_irq_wake(gpio_dev->irq);
-	else
-		disable_irq(gpio_dev->irq);
-	*/
-	
-	dev_info(dev, "initialize rockchip PWM for SIP wakeup\n");
-	
-	rockchip_ir_register_power_key(dev);
-	
-	disable_irq(gpio_dev->irq);
-	dev_info(dev, "GPIO IRQ disabled\n");
-
-	ret = pinctrl_select_state(gpio_dev->pinctrl, gpio_dev->pinctrl_state_suspend);
-	if (ret) {
-		dev_err(dev, "unable to set pin in PWM mode\n");
-		return ret;
-	}
-	dev_info(dev, "set pin configuration to PWM mode\n");
-	
-	rockchip_pwm_hw_init(gpio_dev);
-	dev_info(dev, "stated pin PWM mode\n");
-	
-	return 0;
-}
-
-static int rockchip_ir_recv_resume(struct device *dev)
-{
-	struct rockchip_rc_dev *gpio_dev = dev_get_drvdata(dev);
-	int ret;
-	
-	rockchip_pwm_hw_stop(gpio_dev);
-	dev_info(dev, "stopped pin PWM mode\n");
-	
-	ret = pinctrl_select_state(gpio_dev->pinctrl, gpio_dev->pinctrl_state_default);
-	if (ret) {
-		dev_err(dev, "unable to restore pin in GPIO mode\n");
-		return ret;
-	}
-	dev_info(dev, "restored pin configuration di GPIO\n");
-	
-	enable_irq(gpio_dev->irq);
-	dev_info(dev, "restored GPIO IRQ\n");
-
-	/*
-	if (device_may_wakeup(dev))
-		disable_irq_wake(gpio_dev->irq);
-	else
-		enable_irq(gpio_dev->irq);
-	*/
-
-	return 0;
-}
-
-static void rockchip_ir_recv_shutdown(struct platform_device *pdev)
-{
-	
-	struct device *dev = &pdev->dev;
-	
-	rockchip_ir_recv_suspend(dev);
-	
-	return;
 	
 }
 
