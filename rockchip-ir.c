@@ -338,7 +338,7 @@ static int rockchip_ir_register_power_key(struct device *dev)
 		if (key->keycode != KEY_POWER)
 			continue;
 		
-		scancode = key->scancode & 0xffff00;
+		scancode = ((key->scancode & 0xff0000) >> 8) | ((key->scancode & 0xff00) << 8);
 		scancode |= (~key->scancode) & 0xff;
 		scancode <<= 8;
 		
@@ -700,7 +700,7 @@ static const struct dev_pm_ops rockchip_ir_recv_pm_ops = {
 #endif
 
 static const struct of_device_id rockchip_ir_recv_of_match[] = {
-	{ .compatible = "rockchip-ir", },
+	{ .compatible = "rockchip-ir-receiver", },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, rockchip_ir_recv_of_match);

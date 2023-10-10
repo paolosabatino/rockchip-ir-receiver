@@ -17,11 +17,11 @@ Also you need to add this node in the device tree:
 		gpios = <&gpio1 RK_PB3 GPIO_ACTIVE_LOW>;
 		clocks = <&cru PCLK_PWM>;
 		interrupts = <GIC_SPI 50 IRQ_TYPE_LEVEL_HIGH>;
-		linux,rc-map-name = "rc-rk322x-tvbox";
 		pinctrl-names = "default", "suspend";
 		pinctrl-0 = <&ir_int>;
 		pinctrl-1 = <&pwm3_pin>;
 		pwm-id = <3>;
+		//suspend-is-virtual-poweroff;
 		shutdown-is-virtual-poweroff;
 		wakeup-source;
 		status = "disabled";
