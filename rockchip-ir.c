@@ -325,7 +325,8 @@ static int rockchip_ir_register_power_key(struct device *dev)
 	
 	struct rc_map *key_map;
 	struct rc_map_table *key;
-	int idx, scancode;
+	int idx, key_scancode, rev_scancode;
+	int tee_scancode;
 	
 	key_map = &gpio_dev->rcdev->rc_map;
 	
@@ -337,14 +338,22 @@ static int rockchip_ir_register_power_key(struct device *dev)
 		
 		if (key->keycode != KEY_POWER)
 			continue;
+
+		key_scancode = key->scancode;
+		rev_scancode = ~key_scancode;
+
+		// If key_scancode has higher 16 bits set to 0, then the scancode is NEC protocol, otherwise it is NECX/NEC32
+		if ((key_scancode & 0xffff) == key_scancode)
+			tee_scancode = (key_scancode & 0xff00) | ((rev_scancode & 0xff00) << 8); // NEC protocol
+		else
+			tee_scancode = ((key_scancode & 0xff0000) >> 8) | ((key_scancode & 0xff00) << 8); // NECX/NEC32 protocol
+
+		tee_scancode |= rev_scancode & 0xff;
+		tee_scancode <<= 8;
+	
+		sip_smc_remotectl_config(REMOTECTL_SET_PWRKEY, tee_scancode);
 		
-		scancode = ((key->scancode & 0xff0000) >> 8) | ((key->scancode & 0xff00) << 8);
-		scancode |= (~key->scancode) & 0xff;
-		scancode <<= 8;
-		
-		sip_smc_remotectl_config(REMOTECTL_SET_PWRKEY, scancode);
-		
-		dev_info(dev, "registered scancode %08llx (SIP: %8x)\n", key->scancode, scancode);
+		dev_info(dev, "registered scancode %08x (SIP: %8x)\n", key_scancode, tee_scancode);
 		
 	}
 	
